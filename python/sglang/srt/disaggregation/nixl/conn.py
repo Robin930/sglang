@@ -1301,12 +1301,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
+                    # Another replica of this KV head may write it instead.
+                    sends_kv = dst_info.requires_dcp_relayout or self.should_send_kv(
+                        room, decode_tp_size, dst_info.decode_tp_rank
+                    )
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
                     # Aux data is still sent below when is_last_chunk=True.
                     if (
-                        len(kv_chunk.prefill_kv_indices) > 0
+                        sends_kv
+                        and len(kv_chunk.prefill_kv_indices) > 0
                         and self.kv_args.kv_data_ptrs
                     ):
                         is_dcp_transfer = dst_info.requires_dcp_relayout
@@ -1476,7 +1481,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         # Empty non-final chunks do not consume chunk IDs, so a
                         # final no-KV chunk_id equals the prior KV chunk count.
                         aux_notif = f"{req.room}_aux"
-                        if (
+                        if not sends_kv:
+                            # This rank sent no KV chunk for the room.
+                            aux_notif += f"_nokv_{self.transfer_source_rank}_0"
+                        elif (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                         ):
@@ -2140,6 +2148,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             compute_staging_layout,
             gather_all_layers_to_staging,
             resolve_total_kv_heads,
+            staging_writer_slot,
         )
 
         if self.kv_buffer_tensors is None or staging_buffer is None:
@@ -2167,7 +2176,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
         per_rank_bytes = per_layer_bytes * num_layers * 2
 
-        num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
+        _, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
             dst_attn_tp_size,
             dst_tp_rank,
@@ -2176,7 +2185,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             head_dim * dtype_size,
             num_layers,
         )
-        writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
+        writer_idx = staging_writer_slot(
+            self.attn_tp_size, dst_attn_tp_size, local_tp_rank, total_kv_heads
+        )
         rank_offset = sum(writer_rank_bytes[:writer_idx])
 
         if not staging_buffer.fits(per_rank_bytes):

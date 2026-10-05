@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.common.utils import should_send_kv_replica
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -955,6 +956,35 @@ class CommonKVManager(BaseKVManager):
             )
             return
         self._kv_replica_factor = info.required_dst_info_num
+
+    def should_send_kv(
+        self, room: int, dst_attn_tp_size: int, dst_tp_rank: int
+    ) -> bool:
+        """Whether this rank writes ``room``'s main KV to one decode rank.
+
+        Ranks holding a replicated KV head defer to one elected replica. MLA
+        always sends here: its decode side already pulls from a single source
+        rank and marks the others as dummy targets. Hybrid MLA pulls from every
+        rank for the sharded state, so its replicated latent counts as one head.
+        """
+        if self.is_mla_backend or dst_attn_tp_size >= self.attn_tp_size:
+            return True
+        if self.is_hybrid_mla_backend:
+            total_kv_heads = 1
+        else:
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                resolve_total_kv_heads,
+            )
+
+            total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
+        return should_send_kv_replica(
+            room=room,
+            src_tp=self.attn_tp_size,
+            dst_tp=dst_attn_tp_size,
+            src_tp_rank=self.kv_args.engine_rank,
+            dst_tp_rank=dst_tp_rank,
+            total_kv_heads=total_kv_heads,
+        )
 
     def _make_worker_recv(self, socket, timeout_ms: int = 500):
         """Build the blocking multipart recv used by a worker thread.

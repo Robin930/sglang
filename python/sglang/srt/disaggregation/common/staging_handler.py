@@ -122,12 +122,19 @@ class DecodeStagingHandler:
 
     def num_writers_for(self, receiver) -> int:
         """Compute all TP and PP writers expected for a staging chunk."""
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            staging_writer_ranks,
+        )
+
         prefill_info = receiver.prefill_info
-        prefill_tp = prefill_info.attn_tp_size
-        if prefill_tp > self.decode_tp:
-            tp_writers = prefill_tp // max(1, self.decode_tp)
-        else:
-            tp_writers = 1
+        tp_writers = len(
+            staging_writer_ranks(
+                prefill_info.attn_tp_size,
+                self.decode_tp,
+                self.kv_manager.kv_args.engine_rank,
+                self.total_kv_heads,
+            )
+        )
         pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
         return tp_writers * pp_writers
 

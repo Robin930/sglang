@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.disaggregation.common.utils import kv_replicas_per_destination
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -515,12 +516,10 @@ def _scatter_staging_to_kv_torch(
     dtype_size = k_buffers[0].element_size()
     num_tokens = page_idx_tensor.shape[0] * page_size
 
-    if prefill_attn_tp_size > decode_attn_tp_size:
-        num_writers = prefill_attn_tp_size // max(1, decode_attn_tp_size)
-    else:
-        num_writers = 1
-
-    for writer_rank in range(num_writers):
+    writer_ranks = staging_writer_ranks(
+        prefill_attn_tp_size, decode_attn_tp_size, dst_tp_rank, total_kv_heads
+    )
+    for writer_slot, writer_rank in enumerate(writer_ranks):
         _, num_heads, dst_head_start, _ = compute_head_slice_params(
             prefill_attn_tp_size,
             decode_attn_tp_size,
@@ -530,7 +529,7 @@ def _scatter_staging_to_kv_torch(
         )
         per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
         per_rank_bytes = per_layer_bytes * num_layers * 2
-        rank_base = writer_rank * per_rank_bytes
+        rank_base = writer_slot * per_rank_bytes
 
         offset = rank_base
         for layer_id in range(num_layers):
@@ -584,10 +583,10 @@ def _scatter_staging_to_kv_triton(
     num_tokens = page_idx_tensor.shape[0] * page_size
     device = page_idx_tensor.device
 
-    if prefill_attn_tp_size > decode_attn_tp_size:
-        num_writers = prefill_attn_tp_size // max(1, decode_attn_tp_size)
-    else:
-        num_writers = 1
+    writer_ranks = staging_writer_ranks(
+        prefill_attn_tp_size, decode_attn_tp_size, dst_tp_rank, total_kv_heads
+    )
+    num_writers = len(writer_ranks)
 
     # All writers share the same num_heads; only dst_head_start differs
     _, num_heads, _, _ = compute_head_slice_params(
@@ -616,7 +615,7 @@ def _scatter_staging_to_kv_triton(
                 total_kv_heads,
             )[2]
             * head_dim
-            for wr in range(num_writers)
+            for wr in writer_ranks
         ],
         dtype=torch.int64,
         device=device,
@@ -736,13 +735,13 @@ def compute_staging_layout(
         (num_writers, writer_bytes_list, total_bytes)
         where writer_bytes_list[i] = bytes for writer i covering all layers (K+V).
     """
-    if src_attn_tp_size > dst_attn_tp_size:
-        num_writers = src_attn_tp_size // max(1, dst_attn_tp_size)
-    else:
-        num_writers = 1
+    writer_ranks = staging_writer_ranks(
+        src_attn_tp_size, dst_attn_tp_size, dst_tp_rank, total_kv_heads
+    )
+    num_writers = len(writer_ranks)
 
     writer_bytes = []
-    for wr in range(num_writers):
+    for wr in writer_ranks:
         _, nh, _, _ = compute_head_slice_params(
             src_attn_tp_size,
             dst_attn_tp_size,
@@ -752,6 +751,44 @@ def compute_staging_layout(
         )
         writer_bytes.append(num_tokens * nh * bytes_per_head_token * num_layers * 2)
     return num_writers, writer_bytes, sum(writer_bytes)
+
+
+def staging_writer_ranks(
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    dst_tp_rank: int,
+    total_kv_heads: int,
+) -> range:
+    """Source ranks representing the staging slots of one destination rank.
+
+    Only one replica of each distinct KV head writes (see
+    ``should_send_kv_replica``), so slots are allocated per distinct head rather
+    than per source rank. Slot ``i`` belongs to the ``i``-th representative.
+    """
+    if src_attn_tp_size <= dst_attn_tp_size:
+        return range(1)
+    group_size = src_attn_tp_size // dst_attn_tp_size
+    group_start = (dst_tp_rank % dst_attn_tp_size) * group_size
+    stride = kv_replicas_per_destination(
+        src_attn_tp_size, dst_attn_tp_size, total_kv_heads
+    )
+    return range(group_start, group_start + group_size, stride)
+
+
+def staging_writer_slot(
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    src_tp_rank: int,
+    total_kv_heads: int,
+) -> int:
+    """Staging slot written by ``src_tp_rank``, matching ``staging_writer_ranks``."""
+    if src_attn_tp_size <= dst_attn_tp_size:
+        return 0
+    group_size = src_attn_tp_size // dst_attn_tp_size
+    stride = kv_replicas_per_destination(
+        src_attn_tp_size, dst_attn_tp_size, total_kv_heads
+    )
+    return (src_tp_rank % group_size) // stride
 
 
 def resolve_total_kv_heads(

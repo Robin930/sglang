@@ -1748,7 +1748,10 @@ class MoriKVManager(CommonKVManager):
             info = target.info
             peer_info = target.peer_info
 
-            if not info.is_dummy:
+            # Another replica of this KV head may write it instead.
+            if not info.is_dummy and self.should_send_kv(
+                bootstrap_room, peer_info.decode_tp_size, peer_info.decode_tp_rank
+            ):
                 dst_indices_chunk = info.dst_kv_indices[index_slice]
                 result_statuses.extend(
                     self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)

@@ -1,5 +1,6 @@
 import ctypes
 import dataclasses
+import hashlib
 import struct
 import threading
 from collections import deque
@@ -133,6 +134,56 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+def kv_replicas_per_destination(src_tp: int, dst_tp: int, total_kv_heads: int) -> int:
+    """Number of source ranks holding an identical copy of what one destination rank needs.
+
+    When the source attention TP exceeds both the destination TP and the KV head
+    count, consecutive source ranks hold the same KV head, so several ranks of a
+    destination's source group would write identical bytes.
+    """
+    if (
+        dst_tp <= 0
+        or src_tp <= dst_tp
+        or src_tp % dst_tp
+        or total_kv_heads <= 0
+        or total_kv_heads >= src_tp
+        or src_tp % total_kv_heads
+        or max(total_kv_heads, dst_tp) % min(total_kv_heads, dst_tp)
+    ):
+        return 1
+    return min(src_tp // total_kv_heads, src_tp // dst_tp)
+
+
+def should_send_kv_replica(
+    *,
+    room: int,
+    src_tp: int,
+    dst_tp: int,
+    src_tp_rank: int,
+    dst_tp_rank: int,
+    total_kv_heads: int,
+) -> bool:
+    """Elect one writer among the source ranks holding the same KV head copy.
+
+    The election hashes the bootstrap room shared by all chunks and PP stages of
+    a request, so every source rank agrees without coordination, and load spreads
+    across replicas. Raw room values are not used because their low bits can
+    correlate with DP routing.
+    """
+    replicas = kv_replicas_per_destination(src_tp, dst_tp, total_kv_heads)
+    if replicas == 1:
+        return True
+    local_rank = src_tp_rank % src_tp
+    group_size = src_tp // dst_tp
+    group_start = (dst_tp_rank % dst_tp) * group_size
+    if not group_start <= local_rank < group_start + group_size:
+        return False
+    room_hash = int.from_bytes(
+        hashlib.blake2b(str(room).encode("ascii"), digest_size=8).digest(), "little"
+    )
+    return (local_rank - group_start) % replicas == room_hash % replicas
 
 
 @dataclasses.dataclass(frozen=True)

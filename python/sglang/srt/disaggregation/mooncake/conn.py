@@ -668,6 +668,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             compute_head_slice_params,
             compute_staging_layout,
             resolve_total_kv_heads,
+            staging_writer_slot,
         )
 
         if self.kv_buffer_tensors is None or staging_buffer is None:
@@ -714,7 +715,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             pairs = None
             dst_num_layers = num_layers
 
-        num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
+        _, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
             dst_attn_tp_size,
             dst_tp_rank,
@@ -723,7 +724,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             head_dim * dtype_size,
             dst_num_layers,
         )
-        writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
+        writer_idx = staging_writer_slot(
+            self.attn_tp_size, dst_attn_tp_size, local_tp_rank, total_kv_heads
+        )
         rank_offset = sum(writer_rank_bytes[:writer_idx])
 
         if not staging_buffer.fits(local_bytes):
@@ -2473,6 +2476,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                             )
+                        elif not self.should_send_kv(
+                            req.room,
+                            target_rank_registration_info.dst_attn_tp_size,
+                            target_rank_registration_info.dst_tp_rank,
+                        ):
+                            # Another replica of this KV head writes it.
+                            ret = 0
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend

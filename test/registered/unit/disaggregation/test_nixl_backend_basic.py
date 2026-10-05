@@ -103,6 +103,7 @@ def _fake_staging_buffer_module(mock_gather=None):
     module.StagingAllocator = FakeStagingAllocator
     module.compute_head_slice_params = lambda *args: (0, 1, 0, 1)
     module.compute_staging_layout = lambda *args: (2, [256, 256], 512)
+    module.staging_writer_slot = lambda src_tp, dst_tp, src_rank, heads: src_rank % 2
     module.resolve_total_kv_heads = lambda kv_args, attn_tp_size: 2
     module.gather_all_layers_to_staging = mock_gather or MagicMock()
     return module
@@ -706,6 +707,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.decode_kv_args_table = {
             "agent": SimpleNamespace(
                 decode_tp_size=1,
+                decode_tp_rank=0,
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
                 gpu_id=0,
