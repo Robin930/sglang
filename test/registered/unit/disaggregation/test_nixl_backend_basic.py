@@ -903,6 +903,20 @@ class TestNixlNotifications(CustomTestCase):
         self.assertEqual(status.expected_kvs_per_pp[0], 3)
         self.assertEqual(status.num_pp_ranks_expected, 1)
 
+    def test_unelected_kv_replicas_complete_with_aux_only(self):
+        # P TP4 -> D TP1 with one KV head: source 2 is elected and sends both
+        # KV chunks; the other replicas report zero KV chunks with their aux.
+        replicas = ["7_aux_nokv_0_0", "7_aux_nokv_1_0", "7_aux_nokv_3_0"]
+        elected = ["7_kv_0_0_2", "7_kv_1_1_2", "7_aux"]
+        mgr = self._make_manager(replicas[:-1] + elected, required={7: 4})
+
+        mgr.update_transfer_status()
+        self.assertFalse(mgr.transfer_statuses[7].is_done())
+
+        mgr.agent = NotificationFakeAgent(replicas[-1:])
+        mgr.update_transfer_status()
+        self.assertTrue(mgr.transfer_statuses[7].is_done())
+
     def test_staging_notification_preserves_agent_name_with_underscores(self):
         mgr = self._make_manager(["5_stg_0_1_0_2_4_8_agent_with_underscores"])
         calls = []
